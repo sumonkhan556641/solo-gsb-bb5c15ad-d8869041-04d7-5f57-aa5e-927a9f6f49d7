@@ -16,6 +16,12 @@ from .models import (
     BatchItemResponse,
     CalibrationPlanRequest,
     CalibrationPlanResponse,
+    CausalContradictionCycle,
+    CausalEventIn,
+    CausalObservationCycleStep,
+    CausalRelationCycleStep,
+    CausalVerificationRequest,
+    CausalVerificationResponse,
     ContradictionCycle,
     CycleStep,
     DiagnosisRequest,
@@ -27,8 +33,11 @@ from .models import (
     DriftObservationCycleStep,
     DriftQueryResult,
     DriftSegmentCycleStep,
+    EventRealTime,
+    FeasibleCausalVerification,
     FeasibleDiagnosis,
     FeasibleDriftDiagnosis,
+    InfeasibleCausalVerification,
     InfeasibleDiagnosis,
     InfeasibleDriftDiagnosis,
     NodeOffset,
@@ -44,6 +53,8 @@ from .models import (
 )
 from .solver import (
     CalibrationCandidate,
+    CausalEvent,
+    CausalRelation,
     DriftObservation,
     Observation,
     WindowEvent,
@@ -53,6 +64,7 @@ from .solver import (
     plan_calibration,
     plan_window_peak,
     suggest_repair,
+    verify_causal,
 )
 
 app = FastAPI(
@@ -67,9 +79,13 @@ app = FastAPI(
         "另可在真实时间窗口下求同时入窗的最大事件集合及可行偏移见证；"
         "并可逐条审计观测区间是否已被其余观测蕴含（冗余审计）；"
         "时间漂移接口在时间展开的差分约束图上检查整条时间轴是否可行，"
-        "可行时给出各查询时刻相对参考节点的最紧偏移上下界。"
+        "可行时给出各查询时刻相对参考节点的最紧偏移上下界；"
+        "跨节点因果核验接口在同一组时钟偏移下同时核验静态观测与"
+        "事件先后关系（真实时间=本地时间戳−节点偏移，参考偏移为0），"
+        "可行时给出全部节点偏移见证与各事件真实时间，"
+        "不可行时返回闭合负环。"
     ),
-    version="1.6.0",
+    version="1.7.0",
 )
 
 
@@ -487,4 +503,88 @@ def events_window_peak(request: WindowPeakRequest) -> WindowPeakResponse:
             for node in sorted(offsets)
         ],
         diagnosis=None,
+    )
+
+
+def _causal_cycle_step_model(step):
+    """把 solver 返回的因果矛盾环步骤字典包装为对应响应模型（按 type 分派）。"""
+    if step["type"] == "relation":
+        return CausalRelationCycleStep(
+            relation_id=step["relation_id"],
+            before_event_id=step["before_event_id"],
+            after_event_id=step["after_event_id"],
+            from_=step["from"],
+            to=step["to"],
+            weight=step["weight"],
+            min_interval=step["min_interval"],
+        )
+    return CausalObservationCycleStep(
+        observation_id=step["observation_id"],
+        from_=step["from"],
+        to=step["to"],
+        constraint=step["constraint"],
+        weight=step["weight"],
+        bound=step["bound"],
+    )
+
+
+@app.post(
+    "/api/v1/events/causal-verification",
+    response_model=CausalVerificationResponse,
+    tags=["events"],
+)
+def events_causal_verification(request: CausalVerificationRequest):
+    """跨节点日志因果核验：观测与因果关系能否由同一组时钟偏移共同支持。
+
+    真实时间 = 本地时间戳 − 节点偏移，参考节点偏移为 0；每条关系要求
+    后事件真实时间 − 前事件真实时间 ≥ 非负最小间隔。事件真实时间消去
+    后，观测与关系合并为节点偏移上的差分约束：无负环即可行，返回覆盖
+    全部节点（原诊断节点 ∪ 事件节点）的偏移见证及各事件真实时间；
+    有负环则返回闭合矛盾环，每步标明观测/关系类型、原 ID、节点方向
+    （关系步另含前后事件 ID）与权重，累计权重为负。
+    """
+    result = verify_causal(
+        nodes=request.effective_nodes(),
+        reference=request.reference,
+        observations=[_to_observation(o) for o in request.observations],
+        events=[
+            CausalEvent(id=e.id, node=e.node, timestamp=e.timestamp)
+            for e in request.events
+        ],
+        relations=[
+            CausalRelation(
+                id=r.id,
+                before_id=r.before_event_id,
+                after_id=r.after_event_id,
+                min_interval=r.min_interval,
+            )
+            for r in request.relations
+        ],
+    )
+    if result["feasible"]:
+        return FeasibleCausalVerification(
+            name=request.name,
+            reference=result["reference"],
+            offsets=[
+                NodeOffset(node=item["node"], offset=item["offset"])
+                for item in result["offsets"]
+            ],
+            event_real_times=[
+                EventRealTime(
+                    event_id=item["event_id"],
+                    node=item["node"],
+                    real_time=item["real_time"],
+                )
+                for item in result["event_real_times"]
+            ],
+        )
+
+    cycle = result["cycle"]
+    return InfeasibleCausalVerification(
+        name=request.name,
+        cycle=CausalContradictionCycle(
+            steps=[_causal_cycle_step_model(s) for s in cycle["steps"]],
+            accumulated_bound=cycle["accumulated_bound"],
+            contradiction=cycle["contradiction"],
+        ),
     )

@@ -115,6 +115,28 @@ class WindowEvent:
 
 
 @dataclass(frozen=True)
+class CausalEvent:
+    """一条带本地毫秒时间戳的事件。
+
+    真实时间 = 本地时间戳 ``timestamp`` − 发生节点的时钟偏移。
+    """
+
+    id: str
+    node: str
+    timestamp: float
+
+
+@dataclass(frozen=True)
+class CausalRelation:
+    """一条因果关系：后事件真实时间 − 前事件真实时间 ≥ ``min_interval``（毫秒）。"""
+
+    id: str
+    before_id: str
+    after_id: str
+    min_interval: float
+
+
+@dataclass(frozen=True)
 class DriftObservation:
     """带整数采样秒数的有向时钟观测。
 
@@ -135,6 +157,10 @@ class DriftObservation:
 # backward -> x_v(t1) - x_v(t2) <= rate*(t2-t1)（偏移增量下界）
 _DRIFT_FORWARD = "drift_forward"
 _DRIFT_BACKWARD = "drift_backward"
+
+# 跨节点因果关系边：由「后事件真实时间 - 前事件真实时间 >= 最小间隔」消去
+# 事件真实时间变量后得到，方向为 前事件节点 -> 后事件节点。
+_CAUSAL_RELATION = "relation"
 
 
 def drift_segment_id(node: str, start: int, end: int) -> str:
@@ -285,6 +311,7 @@ def _canonicalize_cycle(cycle_edges: List[Edge]) -> List[Edge]:
         _DRIFT_BACKWARD: 3,
         "window_upper": 4,
         "window_lower": 5,
+        _CAUSAL_RELATION: 6,
     }
     keys = [
         (e.u, e.observation_id, kind_rank[e.kind]) for e in cycle_edges
@@ -1075,4 +1102,156 @@ def diagnose_drift(
         "reference": reference,
         "timeline": list(ordered_timeline),
         "queries": queries,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 跨节点日志因果核验
+# ---------------------------------------------------------------------------
+
+
+def _causal_edges(
+    observations: Sequence[Observation],
+    events: Sequence[CausalEvent],
+    relations: Sequence[CausalRelation],
+) -> List[Edge]:
+    """构造跨节点因果核验的差分约束图（变量仅为节点偏移 x_v）。
+
+    事件 ``e``（节点 ``n``、本地毫秒时间戳 ``t_e``）的真实时间为
+    ``y_e = t_e - x_n``；关系 ``r`` 要求
+    ``y_after - y_before >= d``（``d`` 为非负最小间隔），消去 y 后::
+
+        x_before_node - x_after_node <= t_after - t_before - d
+
+    即一条 ``before_node -> after_node``、权 ``t_after - t_before - d``
+    的差分约束边（可能为负权）。静态观测边与既有诊断完全一致
+    （upper 边 source->target 权 max，lower 边 target->source 权 -min）。
+
+    观测 ID 与关系 ID 仅在各自类别内唯一，因此排序键
+    ``(原 ID, 类型秩)`` 仍唯一（观测秩 0/1，关系秩 6），松弛顺序与
+    矛盾环规范化与提交顺序无关。
+    """
+    edges = _build_edges(observations)
+    event_by_id = {e.id: e for e in events}
+    for rel in relations:
+        before = event_by_id[rel.before_id]
+        after = event_by_id[rel.after_id]
+        edges.append(
+            Edge(
+                u=before.node,
+                v=after.node,
+                weight=_norm(after.timestamp - before.timestamp - rel.min_interval),
+                observation_id=rel.id,
+                kind=_CAUSAL_RELATION,
+                bound=rel.min_interval,
+            )
+        )
+    kind_rank = {
+        "upper": 0,
+        "lower": 1,
+        _DRIFT_FORWARD: 2,
+        _DRIFT_BACKWARD: 3,
+        "window_upper": 4,
+        "window_lower": 5,
+        _CAUSAL_RELATION: 6,
+    }
+    edges.sort(key=lambda e: (e.observation_id, kind_rank[e.kind]))
+    return edges
+
+
+def _causal_cycle_step(edge: Edge, relation_by_id: dict) -> dict:
+    """把因果核验矛盾环上的一条边渲染为对外步骤字典。
+
+    观测步骤与单条诊断的矛盾环同构（constraint=upper/lower）；关系步骤
+    额外回指关系原 ID 与其前后事件 ID，``from``/``to`` 标明节点方向
+    （前事件节点 -> 后事件节点），``weight`` 为消去事件真实时间后的
+    差分边权，``min_interval`` 为关系原始的非负最小间隔。
+    """
+    if edge.kind == _CAUSAL_RELATION:
+        rel = relation_by_id[edge.observation_id]
+        return {
+            "type": "relation",
+            "relation_id": edge.observation_id,
+            "before_event_id": rel.before_id,
+            "after_event_id": rel.after_id,
+            "from": edge.u,
+            "to": edge.v,
+            "weight": _norm(edge.weight),
+            "min_interval": _norm(edge.bound),
+        }
+    return {
+        "type": "observation",
+        "observation_id": edge.observation_id,
+        "from": edge.u,
+        "to": edge.v,
+        "constraint": edge.kind,
+        "weight": _norm(edge.weight),
+        "bound": _norm(edge.bound),
+    }
+
+
+def verify_causal(
+    nodes: Sequence[str],
+    reference: str,
+    observations: Sequence[Observation],
+    events: Sequence[CausalEvent],
+    relations: Sequence[CausalRelation],
+):
+    """核验全部静态观测与跨节点因果关系能否在同一组节点偏移下同时成立。
+
+    约定：真实时间 = 本地时间戳 − 节点偏移，参考节点偏移为 0；
+    关系要求后事件真实时间 − 前事件真实时间 ≥ 非负最小间隔。事件真实
+    时间消去后，观测与关系统一为节点偏移上的差分约束，负环即不可行。
+
+    返回字典：
+      可行   -> {"feasible": True, "reference": ..., "offsets": [...],
+                 "event_real_times": [{"event_id", "node", "real_time"}, ...]}
+                offsets 覆盖全部节点（节点宇宙 = 显式 nodes ∪ 参考节点
+                ∪ 观测端点 ∪ 事件节点），按节点 ID 排序、参考节点恒 0；
+                事件按事件 ID 排序，real_time = timestamp − 该节点见证偏移。
+      不可行 -> {"feasible": False,
+                 "cycle": {"steps": [...], "accumulated_bound": float,
+                           "contradiction": str}}
+                环上每步标明观测/关系类型、原 ID、节点方向（from/to）
+                与权重，关系步另含前后事件 ID 与最小间隔；环经规范化
+                旋转，累计权重为负，结果与提交顺序无关。
+    """
+    ordered_nodes = set(nodes)
+    for event in events:
+        ordered_nodes.add(event.node)
+    ordered_nodes = sorted(ordered_nodes)
+    relation_by_id = {r.id: r for r in relations}
+    edges = _causal_edges(observations, events, relations)
+
+    cycle_edges = _extract_negative_cycle(edges, ordered_nodes)
+    if cycle_edges is not None:
+        cycle_edges = _canonicalize_cycle(cycle_edges)
+        steps = [_causal_cycle_step(e, relation_by_id) for e in cycle_edges]
+        total = _norm(sum(e.weight for e in cycle_edges))
+        return {
+            "feasible": False,
+            "cycle": {
+                "steps": steps,
+                "accumulated_bound": total,
+                "contradiction": f"0 <= {total}",
+            },
+        }
+
+    # 可行：零超源最短路给出一组可行势（偏移），整体平移至参考节点为 0。
+    offsets = _feasible_potentials(edges, ordered_nodes, reference)
+    event_real_times = [
+        {
+            "event_id": event.id,
+            "node": event.node,
+            "real_time": _norm(event.timestamp - offsets[event.node]),
+        }
+        for event in sorted(events, key=lambda e: e.id)
+    ]
+    return {
+        "feasible": True,
+        "reference": reference,
+        "offsets": [
+            {"node": node, "offset": offsets[node]} for node in ordered_nodes
+        ],
+        "event_real_times": event_real_times,
     }
