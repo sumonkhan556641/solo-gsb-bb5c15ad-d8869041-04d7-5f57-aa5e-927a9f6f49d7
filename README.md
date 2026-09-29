@@ -28,7 +28,12 @@
    是否可行**；可行时按查询秒数（至多 8 个）与节点排序给出各时刻相对参考节点
    的最紧偏移上下界，不可达方向为 `null`；不可行时返回包含**原观测 ID 或漂移
    时段标识**的矛盾环；
-9. 提供 **批量诊断接口**，结果按提交下标稳定返回。
+9. 提供 **批量诊断接口**，结果按提交下标稳定返回；
+10. **跨节点日志因果一致性**：接收至多 20 条事件（ID、节点、本地毫秒时间戳）
+    与至多 40 条因果关系（ID、前后事件 ID、非负最小间隔毫秒），在
+    「真实时间 = 本地时间戳 − 节点偏移、参考节点偏移为 0」的同一组偏移下，
+    核验全部静态观测与关系能否同时成立；可行时返回全部节点偏移见证与各事件
+    真实时间，不可行时返回由观测/关系步骤构成的闭合负环。
 
 算法：差分约束图 + Bellman-Ford（超源初始化检测负环、前驱指针回卷提取矛盾环），
 纯 Python 标准实现，无外部服务依赖。
@@ -888,6 +893,145 @@ curl -s -X POST http://localhost:8000/api/v1/diagnose/drift \
 不可行时**不返回任何查询界**；仅由同一时刻观测构成的矛盾，环上只含
 `observation` 步骤。
 
+### `POST /api/v1/events/causal-consistency` — 跨节点日志因果一致性
+
+跨节点日志中的**因果声明必须由同一组时钟偏移共同支持**。提交至多 **20 条
+事件**（ID、节点、本地毫秒时间戳）与至多 **40 条关系**（ID、前后事件 ID、
+非负最小间隔毫秒），服务在静态观测与事件、关系合并后的差分约束图上核验
+它们能否同时成立。
+
+约定（与窗口峰值一致）：
+
+- **真实时间 = 本地时间戳 − 节点偏移**（毫秒）；
+- **参考节点偏移恒为 0**；
+- 关系 `r`（前事件在节点 b、时间戳 t_b；后事件在节点 a、时间戳 t_a；
+  最小间隔 d）要求 `(t_a − x_a) − (t_b − x_b) ≥ d`，即一条差分约束边
+  `b -> a`，权 `t_a − t_b − d`；
+- 节点宇宙为「**原诊断节点**（显式 `nodes` ∪ `reference` ∪ 静态观测端点）
+  ∪ **事件节点**」的并集。
+
+请求体沿用单条诊断的全部字段（`reference` / `observations` / `nodes` /
+`name`，其中静态观测无条数上限、ID 仅观测间唯一），另增加：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `events` | array | 否 | 事件列表，至多 20 条，默认空数组 |
+| `events[].id` | string | 是 | 事件唯一 ID（**仅事件类别内**唯一，可与观测/关系 ID 重名） |
+| `events[].node` | string | 是 | 事件发生的时钟节点（自动并入节点集合） |
+| `events[].timestamp` | number | 是 | 节点本地毫秒时间戳，须为有限数值 |
+| `relations` | array | 否 | 因果关系列表，至多 40 条，默认空数组 |
+| `relations[].id` | string | 是 | 关系唯一 ID（仅关系类别内唯一，可与事件/观测 ID 重名） |
+| `relations[].before` / `after` | string | 是 | 前 / 后事件 ID，必须存在于 `events` 中（悬空引用返回 422） |
+| `relations[].min_interval` | number | 是 | 非负最小间隔（毫秒），须为 ≥ 0 的有限数值 |
+
+响应：
+
+- **可行**：`feasible=true`，`node_offsets` 给出覆盖**全部节点**的一组偏移
+  见证（`{node, offset}`，按节点字典序，参考节点恒为 0），`event_times`
+  给出各事件真实时间（`{event_id, node, timestamp, real_time}`，按事件 ID
+  字典序，`real_time = timestamp − offset`）；
+- **不可行**：`feasible=false`，`cycle` 为闭合负环，环上每步首尾相接、
+  `accumulated_bound` 为负；步骤由 `type` 区分两类：
+  - `{"type": "observation", ...}`：来自静态观测，字段与单条诊断矛盾环同构
+    （`observation_id` / `from` / `to` / `constraint` / `weight` / `bound`）；
+  - `{"type": "relation", ...}`：来自因果关系，含 `relation_id`、
+    `before_event_id`、`after_event_id`、`from`（前事件节点）、`to`
+    （后事件节点）、`weight`（= `t_after − t_before − min_interval`）、
+    `min_interval`（原始非负最小间隔）。
+
+节点与事件均按 ID 排序输出；边按 (ID, 类型) 排序后松弛，矛盾环经规范化
+旋转，**环选择与观测 / 事件 / 关系的提交顺序无关**。
+
+#### 可行响应（示例）
+
+静态观测 `B − A ∈ [0, 100]`；`r1` 要求跨节点的 `e2`（B@1060）比 `e1`
+（A@1000）至少晚 10ms，`r2` 要求同节点的 `e3`（B@1120）比 `e2` 至少晚
+50ms——见证 `x_A = x_B = 0` 下真实时间差为 60ms / 60ms，全部成立：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/events/causal-consistency \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reference": "A",
+    "observations": [
+      {"id": "o1", "source": "A", "target": "B", "min": 0, "max": 100}
+    ],
+    "events": [
+      {"id": "e1", "node": "A", "timestamp": 1000},
+      {"id": "e2", "node": "B", "timestamp": 1060},
+      {"id": "e3", "node": "B", "timestamp": 1120}
+    ],
+    "relations": [
+      {"id": "r1", "before": "e1", "after": "e2", "min_interval": 10},
+      {"id": "r2", "before": "e2", "after": "e3", "min_interval": 50}
+    ]
+  }'
+```
+
+```json
+{
+  "feasible": true,
+  "reference": "A",
+  "name": null,
+  "node_offsets": [
+    {"node": "A", "offset": 0.0},
+    {"node": "B", "offset": 0.0}
+  ],
+  "event_times": [
+    {"event_id": "e1", "node": "A", "timestamp": 1000.0, "real_time": 1000.0},
+    {"event_id": "e2", "node": "B", "timestamp": 1060.0, "real_time": 1060.0},
+    {"event_id": "e3", "node": "B", "timestamp": 1120.0, "real_time": 1120.0}
+  ]
+}
+```
+
+#### 不可行响应（观测边 + 关系边构成负环，示例）
+
+观测只允许 `B − A ∈ [0, 10]`，而关系 `r1` 要求 `e2`（B@1050）比 `e1`
+（A@1000）至少晚 100ms：关系边 `A -> B` 权 `1050 − 1000 − 100 = -50`，
+观测下界边 `B -> A` 权 `0`，环权 −50，矛盾：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/events/causal-consistency \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reference": "A",
+    "observations": [
+      {"id": "o1", "source": "A", "target": "B", "min": 0, "max": 10}
+    ],
+    "events": [
+      {"id": "e1", "node": "A", "timestamp": 1000},
+      {"id": "e2", "node": "B", "timestamp": 1050}
+    ],
+    "relations": [
+      {"id": "r1", "before": "e1", "after": "e2", "min_interval": 100}
+    ]
+  }'
+```
+
+```json
+{
+  "feasible": false,
+  "name": null,
+  "cycle": {
+    "steps": [
+      {"type": "relation", "relation_id": "r1",
+       "before_event_id": "e1", "after_event_id": "e2",
+       "from": "A", "to": "B", "weight": -50.0, "min_interval": 100.0},
+      {"type": "observation", "observation_id": "o1",
+       "from": "B", "to": "A", "constraint": "lower",
+       "weight": 0.0, "bound": 0.0}
+    ],
+    "accumulated_bound": -50.0,
+    "contradiction": "0 <= -50.0"
+  }
+}
+```
+
+同一节点上两事件时间戳差小于最小间隔时，关系展开为权为负的**自环**
+（如 B@1000 → B@1020 却要求间隔 ≥ 30，自环权 `20 − 30 = -10`），
+单步即构成闭合负环。
+
 ### `POST /api/v1/diagnose/batch` — 批量诊断
 
 请求体 `{"diagnoses": [ <单条请求>, ... ]}`（至少 1 条）。每条可带 `name`，
@@ -922,7 +1066,10 @@ HTTP `422` 及详细错误信息。校准方案接口还会拒绝：`targets` �
 时间漂移接口还会拒绝：采样秒数或查询秒数为负数/非整数（含布尔、浮点、字符串）、
 查询秒数超过 8 个或彼此重复、观测与查询涉及的不同时刻合计超过 40 个、观测 ID 重复、
 节点宇宙中缺少非参考节点的漂移速率、给参考节点或未知节点配置速率、
-速率为负或非有限数值等。
+速率为负或非有限数值等。因果一致性接口还会拒绝：事件超过 20 条、关系超过
+40 条、事件 ID 重复、关系 ID 重复（两类 ID 仅在各自类别内唯一，跨类别允许
+重名）、关系的前后事件 ID 在 `events` 中不存在（悬空引用）、最小间隔为负、
+事件时间戳或最小间隔为非有限数值等。
 
 ---
 
@@ -968,6 +1115,15 @@ HTTP `422` 及详细错误信息。校准方案接口还会拒绝：`targets` �
   完全复用同一套负环检测（可行性）与以 `(reference, 查询秒)` 为源的双向
   Bellman-Ford（最紧上下界，不可达方向为 `null`）。矛盾环上的边按类型回指
   原观测 ID 或漂移时段标识，环经规范化旋转，结果与观测/速率的提交顺序无关。
+- **跨节点日志因果一致性**：事件 e（节点 n、本地时间戳 t）的真实时间为
+  `t − x_n`；关系「后事件 − 前事件 ≥ d（毫秒）」展开为单边
+  `前事件节点 -> 后事件节点`，权 `t_after − t_before − d`（同节点关系
+  即为自环，权负时一步成环）。关系边与静态观测边合并后复用同一套负环检测
+  与零超源可行势求解：负环 ⇔ 全部观测与关系不能由同一组偏移支持；可行时
+  把可行势整体平移至参考节点为 0 作为偏移见证，各事件真实时间由
+  `t − x_n` 给出。节点宇宙取原诊断节点（显式 `nodes` ∪ `reference` ∪
+  观测端点）与事件节点的并集；节点与事件按 ID 排序，矛盾环按
+  (起点节点, 原 ID, 类型) 规范化旋转，结果与提交顺序无关。
 
 结果顺序的确定性保证：
 
@@ -982,9 +1138,9 @@ HTTP `422` 及详细错误信息。校准方案接口还会拒绝：`targets` �
 
 ```
 app/
-  main.py      # FastAPI 路由：/api/v1/diagnose、/api/v1/diagnose/drift、/api/v1/diagnose/batch、/api/v1/diagnose/repair、/api/v1/diagnose/calibration-plan、/api/v1/diagnose/redundancy-audit、/api/v1/events/window-peak、/health
-  models.py    # 请求/响应 Pydantic 模型与入参校验（含时间漂移请求/矛盾环/查询界模型）
-  solver.py    # 差分约束建模、Bellman-Ford、证据链规范选择、负环提取与规范化、最小删除集合搜索、最小成本校准方案、窗口峰值求解与可行偏移见证、逐条观测冗余审计、时间展开的漂移诊断
+  main.py      # FastAPI 路由：/api/v1/diagnose、/api/v1/diagnose/drift、/api/v1/diagnose/batch、/api/v1/diagnose/repair、/api/v1/diagnose/calibration-plan、/api/v1/diagnose/redundancy-audit、/api/v1/events/window-peak、/api/v1/events/causal-consistency、/health
+  models.py    # 请求/响应 Pydantic 模型与入参校验（含时间漂移、因果一致性请求/矛盾环模型）
+  solver.py    # 差分约束建模、Bellman-Ford、证据链规范选择、负环提取与规范化、最小删除集合搜索、最小成本校准方案、窗口峰值求解与可行偏移见证、逐条观测冗余审计、时间展开的漂移诊断、跨节点日志因果一致性核验
 tests/         # 算法层与 HTTP 接口测试
 Dockerfile
 docker-compose.yml

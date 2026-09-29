@@ -737,3 +737,176 @@ class InfeasibleDriftDiagnosis(BaseModel):
 
 
 DriftDiagnosisResponse = Union[FeasibleDriftDiagnosis, InfeasibleDriftDiagnosis]
+
+
+# ---------------------------------------------------------------------------
+# 跨节点日志因果一致性
+# ---------------------------------------------------------------------------
+
+
+class CausalEventIn(BaseModel):
+    """一条跨节点日志事件：真实时间 = 本地毫秒时间戳 − 节点偏移。"""
+
+    id: str = Field(..., min_length=1, description="事件的唯一 ID（仅事件间唯一）")
+    node: str = Field(..., min_length=1, description="事件发生的时钟节点（自动并入节点集）")
+    timestamp: float = Field(
+        ..., description="节点本地毫秒时间戳，须为有限数值（NaN/±inf 拒绝）"
+    )
+
+    model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def _check(self) -> "CausalEventIn":
+        if not math.isfinite(self.timestamp):
+            raise ValueError("timestamp 必须为有限数值")
+        return self
+
+
+class CausalRelationIn(BaseModel):
+    """一条因果关系：after 事件真实时间 − before 事件真实时间 ≥ min_interval 毫秒。"""
+
+    id: str = Field(..., min_length=1, description="关系的唯一 ID（仅关系间唯一）")
+    before: str = Field(..., min_length=1, description="前事件 ID（必须存在于 events 中）")
+    after: str = Field(..., min_length=1, description="后事件 ID（必须存在于 events 中）")
+    min_interval: float = Field(
+        ..., ge=0, description="非负最小间隔（毫秒），须为 ≥ 0 的有限数值"
+    )
+
+    model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def _check(self) -> "CausalRelationIn":
+        if not math.isfinite(self.min_interval):
+            raise ValueError("min_interval 必须为有限数值")
+        return self
+
+
+class CausalConsistencyRequest(DiagnosisRequest):
+    """因果一致性请求：沿用静态观测字段，另给至多 20 条事件与至多 40 条关系。"""
+
+    events: List[CausalEventIn] = Field(
+        default_factory=list,
+        max_length=20,
+        description="至多 20 条事件（ID、节点、有限本地毫秒时间戳），默认空数组",
+    )
+    relations: List[CausalRelationIn] = Field(
+        default_factory=list,
+        max_length=40,
+        description="至多 40 条因果关系（ID、前后事件 ID、非负最小间隔毫秒），默认空数组",
+    )
+
+    @model_validator(mode="after")
+    def _check(self) -> "CausalConsistencyRequest":
+        # 复用基础诊断的全部校验（reference∈nodes、静态观测 ID 唯一等）。
+        DiagnosisRequest._check(self)
+
+        event_ids = [e.id for e in self.events]
+        if len(event_ids) != len(set(event_ids)):
+            raise ValueError("events 中存在重复的事件 ID")
+
+        relation_ids = [r.id for r in self.relations]
+        if len(relation_ids) != len(set(relation_ids)):
+            raise ValueError("relations 中存在重复的关系 ID")
+
+        known_events = set(event_ids)
+        dangling = sorted(
+            {
+                ref
+                for r in self.relations
+                for ref in (r.before, r.after)
+                if ref not in known_events
+            }
+        )
+        if dangling:
+            raise ValueError(f"关系引用了不存在的事件 ID：{dangling}")
+        return self
+
+    def effective_nodes(self) -> List[str]:
+        """合并显式节点、静态观测端点、参考节点与事件节点。"""
+        nodes = set(super().effective_nodes())
+        nodes.update(e.node for e in self.events)
+        return sorted(nodes)
+
+
+class EventRealTime(BaseModel):
+    """一条事件在见证偏移下的真实时间（毫秒）。"""
+
+    event_id: str = Field(..., description="事件 ID")
+    node: str = Field(..., description="事件发生的时钟节点")
+    timestamp: float = Field(..., description="事件的本地毫秒时间戳")
+    real_time: float = Field(
+        ..., description="真实时间 = 本地时间戳 − 节点偏移（毫秒）"
+    )
+
+
+class CausalObservationCycleStep(BaseModel):
+    """矛盾环中来自一条静态观测的约束边。"""
+
+    type: Literal["observation"] = "observation"
+    observation_id: str
+    from_: str = Field(..., serialization_alias="from", description="边的起点节点")
+    to: str = Field(..., description="边的终点节点")
+    constraint: Literal["upper", "lower"] = Field(
+        ..., description="upper=对应 max 约束边，lower=对应 -min 约束边"
+    )
+    weight: float = Field(..., description="该边在差分约束图中的权重（毫秒）")
+    bound: float = Field(..., description="观测区间对应的原始端点值（毫秒）")
+
+    model_config = {"populate_by_name": True}
+
+
+class CausalRelationCycleStep(BaseModel):
+    """矛盾环中来自一条因果关系的约束边。"""
+
+    type: Literal["relation"] = "relation"
+    relation_id: str = Field(..., description="该边来源的关系 ID")
+    before_event_id: str = Field(..., description="关系的前事件 ID")
+    after_event_id: str = Field(..., description="关系的后事件 ID")
+    from_: str = Field(
+        ..., serialization_alias="from", description="边的起点节点（前事件节点）"
+    )
+    to: str = Field(..., description="边的终点节点（后事件节点）")
+    weight: float = Field(
+        ...,
+        description="差分约束边权重 = 后事件时间戳 − 前事件时间戳 − 最小间隔（毫秒）",
+    )
+    min_interval: float = Field(..., description="关系的原始非负最小间隔（毫秒）")
+
+    model_config = {"populate_by_name": True}
+
+
+CausalCycleStep = Annotated[
+    Union[CausalObservationCycleStep, CausalRelationCycleStep],
+    Field(discriminator="type"),
+]
+
+
+class CausalContradictionCycle(BaseModel):
+    steps: List[CausalCycleStep] = Field(..., description="沿矛盾环方向排列的边")
+    accumulated_bound: float = Field(
+        ..., description="环上权重之和（负数），即推出的 0 <= 该负数"
+    )
+    contradiction: str = Field(..., description="人类可读的矛盾式，例如 '0 <= -2.0'")
+
+
+class FeasibleCausalDiagnosis(BaseModel):
+    feasible: Literal[True] = True
+    reference: str
+    name: Optional[str] = None
+    node_offsets: List[NodeOffset] = Field(
+        ...,
+        description="覆盖全部节点（静态观测端点与事件节点并集）的偏移见证，"
+        "按节点字典序，参考节点恒为 0",
+    )
+    event_times: List[EventRealTime] = Field(
+        ..., description="各事件的真实时间，按事件 ID 字典序"
+    )
+
+
+class InfeasibleCausalDiagnosis(BaseModel):
+    feasible: Literal[False] = False
+    name: Optional[str] = None
+    cycle: CausalContradictionCycle
+
+
+CausalConsistencyResponse = Union[FeasibleCausalDiagnosis, InfeasibleCausalDiagnosis]

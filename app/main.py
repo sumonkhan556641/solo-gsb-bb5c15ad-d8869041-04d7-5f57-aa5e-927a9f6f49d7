@@ -16,6 +16,11 @@ from .models import (
     BatchItemResponse,
     CalibrationPlanRequest,
     CalibrationPlanResponse,
+    CausalConsistencyRequest,
+    CausalConsistencyResponse,
+    CausalContradictionCycle,
+    CausalObservationCycleStep,
+    CausalRelationCycleStep,
     ContradictionCycle,
     CycleStep,
     DiagnosisRequest,
@@ -27,8 +32,11 @@ from .models import (
     DriftObservationCycleStep,
     DriftQueryResult,
     DriftSegmentCycleStep,
+    EventRealTime,
+    FeasibleCausalDiagnosis,
     FeasibleDiagnosis,
     FeasibleDriftDiagnosis,
+    InfeasibleCausalDiagnosis,
     InfeasibleDiagnosis,
     InfeasibleDriftDiagnosis,
     NodeOffset,
@@ -44,11 +52,14 @@ from .models import (
 )
 from .solver import (
     CalibrationCandidate,
+    CausalEvent,
+    CausalRelation,
     DriftObservation,
     Observation,
     WindowEvent,
     audit_redundancy,
     diagnose,
+    diagnose_causal,
     diagnose_drift,
     plan_calibration,
     plan_window_peak,
@@ -67,9 +78,12 @@ app = FastAPI(
         "另可在真实时间窗口下求同时入窗的最大事件集合及可行偏移见证；"
         "并可逐条审计观测区间是否已被其余观测蕴含（冗余审计）；"
         "时间漂移接口在时间展开的差分约束图上检查整条时间轴是否可行，"
-        "可行时给出各查询时刻相对参考节点的最紧偏移上下界。"
+        "可行时给出各查询时刻相对参考节点的最紧偏移上下界；"
+        "跨节点日志因果一致性接口在同一组时钟偏移下核验静态观测与"
+        "事件间最小间隔关系能否同时成立，可行时给出偏移见证与各事件真实时间，"
+        "不可行时返回闭合负环。"
     ),
-    version="1.6.0",
+    version="1.7.0",
 )
 
 
@@ -487,4 +501,84 @@ def events_window_peak(request: WindowPeakRequest) -> WindowPeakResponse:
             for node in sorted(offsets)
         ],
         diagnosis=None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 跨节点日志因果一致性
+# ---------------------------------------------------------------------------
+
+
+def _causal_cycle_step_model(step):
+    """把因果一致性 solver 返回的矛盾环步骤字典包装为对应响应模型。"""
+    if step["type"] == "relation":
+        return CausalRelationCycleStep(
+            relation_id=step["relation_id"],
+            before_event_id=step["before_event_id"],
+            after_event_id=step["after_event_id"],
+            from_=step["from"],
+            to=step["to"],
+            weight=step["weight"],
+            min_interval=step["min_interval"],
+        )
+    return CausalObservationCycleStep(
+        observation_id=step["observation_id"],
+        from_=step["from"],
+        to=step["to"],
+        constraint=step["constraint"],
+        weight=step["weight"],
+        bound=step["bound"],
+    )
+
+
+@app.post(
+    "/api/v1/events/causal-consistency",
+    response_model=CausalConsistencyResponse,
+    tags=["events"],
+)
+def events_causal_consistency(request: CausalConsistencyRequest) -> CausalConsistencyResponse:
+    """跨节点日志因果一致性核验：全部观测与最小间隔关系能否被同一组偏移支持。
+
+    事件真实时间 = 本地毫秒时间戳 − 节点偏移，参考节点偏移为 0；关系
+    要求后事件与前事件的真实时间之差不小于非负最小间隔。静态观测边与
+    关系边合并为差分约束系统：无负环即可行，返回按节点排序的偏移见证
+    （参考节点为 0）与按事件 ID 排序的真实时间；有负环即不可行，
+    返回闭合负环，每步标明观测或关系类型、原 ID、节点方向与权重。
+    节点宇宙取原诊断节点（显式 nodes ∪ reference ∪ 观测端点）与事件
+    节点的并集；ID 仅在各自类别内唯一，环选择与提交顺序无关。
+    """
+    result = diagnose_causal(
+        nodes=request.effective_nodes(),
+        reference=request.reference,
+        observations=[_to_observation(o) for o in request.observations],
+        events=[
+            CausalEvent(id=e.id, node=e.node, timestamp=e.timestamp)
+            for e in request.events
+        ],
+        relations=[
+            CausalRelation(
+                id=r.id, before=r.before, after=r.after, min_interval=r.min_interval
+            )
+            for r in request.relations
+        ],
+    )
+    if result["feasible"]:
+        return FeasibleCausalDiagnosis(
+            name=request.name,
+            reference=result["reference"],
+            node_offsets=[
+                NodeOffset(node=item["node"], offset=item["offset"])
+                for item in result["node_offsets"]
+            ],
+            event_times=[EventRealTime(**item) for item in result["event_times"]],
+        )
+
+    cycle = result["cycle"]
+    return InfeasibleCausalDiagnosis(
+        name=request.name,
+        cycle=CausalContradictionCycle(
+            steps=[_causal_cycle_step_model(s) for s in cycle["steps"]],
+            accumulated_bound=cycle["accumulated_bound"],
+            contradiction=cycle["contradiction"],
+        ),
     )
